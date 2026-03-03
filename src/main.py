@@ -436,14 +436,30 @@ def initialize_services(bot: Bot, tg_loop):
         me = await bot.get_me()
         return me.username or me.first_name
 
-    try:
-        ROBOT_TG_NAME = asyncio.run_coroutine_threadsafe(
-            _get_bot_name(), tg_loop
-        ).result(timeout=10)
-        logger.info(f"获取到 Bot 名称: {ROBOT_TG_NAME}")
-    except Exception as e:
-        logger.warning(f"获取 Bot 名称失败: {str(e)}")
-        ROBOT_TG_NAME = ""
+    # 优先从配置中读取用户填写的 BOT_NAME
+    ROBOT_TG_NAME = getattr(getattr(config, 'bot', None), 'name', '')
+
+    # 如果配置中没有，则尝试从 Telegram API 获取（带重试）
+    if not ROBOT_TG_NAME:
+        async def _get_bot_name_with_retry():
+            for attempt in range(3):  # 最多重试3次
+                try:
+                    me = await bot.get_me()
+                    return me.username or me.first_name
+                except Exception as e:
+                    if attempt == 2:
+                        raise
+                    logger.warning(f"获取 Bot 名称失败 (尝试 {attempt + 1}/3): {e}")
+                    await asyncio.sleep(1)
+
+        try:
+            ROBOT_TG_NAME = asyncio.run_coroutine_threadsafe(
+                _get_bot_name_with_retry(), tg_loop
+            ).result(timeout=15)
+            logger.info(f"从 API 获取到 Bot 名称: {ROBOT_TG_NAME}")
+        except Exception as e:
+            logger.warning(f"获取 Bot 名称最终失败: {str(e)}")
+            ROBOT_TG_NAME = ""
 
     # 创建消息处理器
     message_handler = BotMessageHandler(

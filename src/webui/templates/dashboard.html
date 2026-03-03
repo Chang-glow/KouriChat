@@ -6,21 +6,21 @@
     
     <!-- SEO Meta Tags -->
     <title>KouriChat - AI 情感陪伴系统控制台</title>
-    <meta name="description" content="KouriChat 是基于 DeepSeek LLM 的情感陪伴系统，支持微信机器人接入，提供沉浸式角色扮演和多轮对话体验。">
-    <meta name="keywords" content="KouriChat, AI陪伴, DeepSeek, 情感陪伴, 角色扮演, AI助手, 微信机器人, LLM, AI对话">
+    <meta name="description" content="KouriChat 是基于 DeepSeek LLM 的情感陪伴系统，支持TG机器人接入，提供沉浸式角色扮演和多轮对话体验。">
+    <meta name="keywords" content="KouriChat, AI陪伴, DeepSeek, 情感陪伴, 角色扮演, AI助手, TG机器人, LLM, AI对话">
     
     <!-- Open Graph / Facebook -->
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://github.com/KouriChat/KouriChat">
     <meta property="og:title" content="KouriChat - AI 情感陪伴系统">
-    <meta property="og:description" content="基于 DeepSeek LLM 的情感陪伴系统，支持微信机器人接入，提供沉浸式角色扮演体验。">
+    <meta property="og:description" content="基于 DeepSeek LLM 的情感陪伴系统，支持TG机器人接入，提供沉浸式角色扮演体验。">
     <meta property="og:image" content="https://raw.githubusercontent.com/KouriChat/KouriChat/main/ATRI.jpg">
     
     <!-- Twitter -->
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:url" content="https://github.com/KouriChat/KouriChat">
     <meta name="twitter:title" content="KouriChat - AI 情感陪伴系统">
-    <meta name="twitter:description" content="基于 DeepSeek LLM 的情感陪伴系统，支持微信机器人接入，提供沉浸式角色扮演体验。">
+    <meta name="twitter:description" content="基于 DeepSeek LLM 的情感陪伴系统，支持TG机器人接入，提供沉浸式角色扮演体验。">
     <meta name="twitter:image" content="https://raw.githubusercontent.com/KouriChat/KouriChat/main/ATRI.jpg">
     
     <!-- 其他 Meta -->
@@ -46,7 +46,7 @@
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
         "name": "KouriChat",
-        "description": "基于 DeepSeek LLM 的情感陪伴系统，支持微信和机器人接入，提供沉浸式角色扮演体验。",
+        "description": "基于 DeepSeek LLM 的情感陪伴系统，支持TG和机器人接入，提供沉浸式角色扮演体验。",
         "operatingSystem": "Windows",
         "applicationCategory": "ChatApplication",
         "offers": {
@@ -67,7 +67,7 @@
         },
         "downloadUrl": "https://github.com/KouriChat/KouriChat",
         "softwareVersion": "1.4.1",
-        "keywords": "AI陪伴,DeepSeek,情感陪伴,角色扮演,AI助手,微信机器人,QQ机器人,LLM,AI对话"
+        "keywords": "AI陪伴,DeepSeek,情感陪伴,角色扮演,AI助手,TG机器人,QQ机器人,LLM,AI对话"
     }
     </script>
     <style>
@@ -820,9 +820,6 @@
                         <i class="bi bi-robot me-2"></i>机器人状态
                     </h4>
                     <div class="bot-controls">
-                        <button class="btn btn-wechat me-2" onclick="reconnectWechat()" id="reconnectBtn">
-                            <i class="bi bi-wechat"></i>微信掉线重连
-                        </button>
                         <button class="btn btn-glass text-success me-2" onclick="startBot()" id="startBotBtn">
                             <i class="bi bi-play-fill me-1"></i>启动
                         </button>

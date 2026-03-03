@@ -14,12 +14,17 @@ from datetime import datetime, timedelta
 logger = logging.getLogger('main')
 
 class AutoSendHandler:
-    def __init__(self, message_handler, config, listen_list):
+    def __init__(self, message_handler, config, default_chat_id=None):
         self.message_handler = message_handler
         self.config = config
-        self.listen_list = listen_list
-        
-        # 计时器相关
+        self.default_chat_id = default_chat_id  # 保存默认发送目标
+
+        # 如果未提供 default_chat_id，尝试从配置中获取第一个允许的 chat_id
+        if not self.default_chat_id:
+            allowed_ids = getattr(config.user, 'telegram_chat_ids', [])
+            if allowed_ids:
+                self.default_chat_id = allowed_ids[0]
+
         self.countdown_timer = None
         self.is_countdown_running = False
         self.countdown_end_time = None
@@ -56,14 +61,13 @@ class AutoSendHandler:
         return random.uniform(min_seconds, max_seconds)
 
     def auto_send_message(self):
-        """自动发送消息"""
         if self.is_quiet_time():
             logger.info("当前处于安静时间，跳过自动发送消息")
             self.start_countdown()
             return
-            
-        if self.listen_list:
-            user_id = random.choice(self.listen_list)
+
+        if self.default_chat_id:
+            user_id = self.default_chat_id
             self.unanswered_count += 1
             reply_content = f"{self.config.behavior.auto_message.content}"
             logger.info(f"自动发送消息到 {user_id}: {reply_content}")
@@ -80,7 +84,7 @@ class AutoSendHandler:
                 logger.error(f"自动发送消息失败: {str(e)}")
                 self.start_countdown()
         else:
-            logger.error("没有可用的聊天对象")
+            logger.error("没有可用的默认聊天对象，无法发送自动消息")
             self.start_countdown()
 
     def start_countdown(self):

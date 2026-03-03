@@ -38,11 +38,11 @@ class DebugCommandHandler:
                 from data.config import config
                 self.content_generator = ContentGenerator(
                     root_dir=self.root_dir,
-                    api_key=config.OPENAI_API_KEY,
-                    base_url=config.OPENAI_API_BASE,
-                    model=config.OPENAI_API_MODEL,
-                    max_token=config.OPENAI_MAX_TOKENS,
-                    temperature=config.OPENAI_TEMPERATURE
+                    api_key=config.llm.api_key,
+                    base_url=config.llm.base_url,
+                    model=config.llm.model,
+                    max_token=config.llm.max_tokens,
+                    temperature=config.llm.temperature
                 )
                 logger.info("内容生成服务初始化成功")
             except Exception as e:

@@ -1,10 +1,13 @@
 import logging
-import random
-from datetime import datetime, timedelta
 import threading
 import time
 import os
 import shutil
+import asyncio
+import re
+import queue
+import collections
+
 from src.utils.console import print_status
 
 # 率先初始化网络适配器以覆盖所有网络库
@@ -17,21 +20,25 @@ except Exception as e:
 
 # 导入其余模块
 from data.config import config, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL, MAX_TOKEN, TEMPERATURE, MAX_GROUPS
-from wxauto import WeChat
-import re
+from telegram import Update, Bot
+from telegram.ext import (
+    ApplicationBuilder,
+    Application,
+    CommandHandler,
+    MessageHandler as TGMessageHandler,
+    ContextTypes,
+    filters,
+)
 from src.handlers.emoji import EmojiHandler
 from src.handlers.image import ImageHandler
-from src.handlers.message import MessageHandler
-from src.services.ai.llm_service import LLMService
+from src.handlers.message import MessageHandler as BotMessageHandler
 from src.services.ai.image_recognition_service import ImageRecognitionService
 from modules.memory.memory_service import MemoryService
 from modules.memory.content_generator import ContentGenerator
 from src.utils.logger import LoggerConfig
-from colorama import init, Style
+from colorama import init
 from src.AutoTasker.autoTasker import AutoTasker
 from src.handlers.autosend import AutoSendHandler
-import queue
-from collections import defaultdict
 
 # 创建一个事件对象来控制线程的终止
 stop_event = threading.Event()
@@ -44,139 +51,202 @@ config_path = os.path.join(root_dir, 'src', 'config', 'config.json')
 config_template_path = os.path.join(root_dir, 'src', 'config', 'config.json.template')
 
 if not os.path.exists(config_path) and os.path.exists(config_template_path):
-    logger = logging.getLogger('main')
-    logger.info("配置文件不存在，正在从模板创建...")
+    _tmp_logger = logging.getLogger('main')
+    _tmp_logger.info("配置文件不存在，正在从模板创建...")
     shutil.copy2(config_template_path, config_path)
-    logger.info(f"已从模板创建配置文件: {config_path}")
+    _tmp_logger.info(f"已从模板创建配置文件: {config_path}")
 
 # 初始化colorama
 init()
 
 # 全局变量
 logger = None
-listen_list = []
+
 
 def initialize_logging():
     """初始化日志系统"""
-    global logger, listen_list
+    global logger
 
-    # 清除所有现有日志处理器
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
 
     logger_config = LoggerConfig(root_dir)
     logger = logger_config.setup_logger('main')
-    listen_list = config.user.listen_list
-    
-    # 确保autoupdate模块的日志级别设置为DEBUG
+
     logging.getLogger("autoupdate").setLevel(logging.DEBUG)
     logging.getLogger("autoupdate.core").setLevel(logging.DEBUG)
     logging.getLogger("autoupdate.interceptor").setLevel(logging.DEBUG)
     logging.getLogger("autoupdate.network_optimizer").setLevel(logging.DEBUG)
 
-# 消息队列接受消息时间间隔
-wait = 1
 
-# 添加消息队列用于分发
+# 消息队列
 private_message_queue = queue.Queue()
 group_message_queue = queue.Queue()
 
+
+# ── 修复4：有界消息去重缓存，防止 processed_messages 无限增长 ────────────────────
+
+_PROCESSED_MSG_MAX = 2000
+
+
+class BoundedMessageCache:
+    """线程安全的有界消息去重缓存，超出上限时自动淘汰最旧条目"""
+
+    def __init__(self, maxsize: int = _PROCESSED_MSG_MAX):
+        self._maxsize = maxsize
+        self._keys: set = set()
+        self._order: collections.deque = collections.deque()
+        self._lock = threading.Lock()
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._keys
+
+    def add(self, key: str):
+        with self._lock:
+            if key in self._keys:
+                return
+            self._keys.add(key)
+            self._order.append(key)
+            while len(self._order) > self._maxsize:
+                oldest = self._order.popleft()
+                self._keys.discard(oldest)
+
+
+# ── 消息封装 ──────────────────────────────────────────────────────────────────────
+
+class TelegramMessage:
+    """统一封装 Telegram Update，供处理器使用"""
+
+    def __init__(self, update: Update):
+        msg = update.effective_message
+        self.id = str(msg.message_id)
+        self.type = "friend"
+        self.content = msg.text or msg.caption or ""
+        self.sender = str(update.effective_user.id) if update.effective_user else "unknown"
+        self.sender_name = update.effective_user.full_name if update.effective_user else "unknown"
+        self.chat_id = str(update.effective_chat.id)
+        self.chat_type = update.effective_chat.type  # "private" / "group" / "supergroup"
+        self.photo = msg.photo[-1] if msg.photo else None
+        self.document = msg.document if msg.document else None
+        self.raw = msg
+
+
+# ── 私聊机器人 ────────────────────────────────────────────────────────────────────
+
 class PrivateChatBot:
-    """专门处理私聊的机器人"""
-    def __init__(self, message_handler, image_recognition_service, auto_sender, emoji_handler):
-        self.message_handler = message_handler
+    """处理 Telegram 私聊消息"""
+
+    def __init__(self, msg_handler, image_recognition_service, auto_sender,
+                 emoji_handler, bot: Bot, tg_loop, memory_service_ref):  # 修复1：新增 memory_service_ref
+        self.message_handler = msg_handler
         self.image_recognition_service = image_recognition_service
         self.auto_sender = auto_sender
         self.emoji_handler = emoji_handler
-        self.wx = WeChat()
-        self.robot_name = self.wx.A_MyIcon.Name
-        logger.info(f"私聊机器人初始化完成 - 机器人名称: {self.robot_name}")
-        
-        # 私聊始终使用默认人设
-        from data.config import config
+        self.bot = bot
+        self.tg_loop = tg_loop
+        self.memory_service = memory_service_ref          # 修复1：保存引用
+        self._initialized_users: set = set()              # 修复1：已初始化用户缓存
+        self.robot_name = getattr(getattr(config, 'bot', None), 'name', 'Bot')
+
         default_avatar_path = config.behavior.context.avatar_dir
         self.current_avatar = os.path.basename(default_avatar_path)
-        logger.info(f"私聊机器人使用默认人设: {self.current_avatar}")
+        logger.info(f"私聊机器人初始化完成 - 名称: {self.robot_name}, 人设: {self.current_avatar}")
 
-    def handle_private_message(self, msg, chat_name):
-        """处理私聊消息"""
+    def _ensure_user_memory(self, username: str):
+        """修复1 & 5：首次遇到该用户时动态初始化记忆文件"""
+        if username in self._initialized_users:
+            return
         try:
-            username = msg.sender
-            content = getattr(msg, 'content', None) or getattr(msg, 'text', None)
+            avatar_dir_path = os.path.join(root_dir, config.behavior.context.avatar_dir)
+            avatar_name = os.path.basename(avatar_dir_path)
+            self.memory_service.initialize_memory_files(avatar_name, user_id=username)
+            self._initialized_users.add(username)
+            logger.info(f"[私聊] 用户 '{username}' 记忆初始化完成")
+        except Exception as e:
+            logger.error(f"[私聊] 用户 '{username}' 记忆初始化失败: {str(e)}")
 
-            # 重置倒计时
+    def handle_private_message(self, tg_msg: TelegramMessage):
+        try:
+            username = tg_msg.sender
+            sender_name = tg_msg.sender_name
+            content = tg_msg.content
+
+            self._ensure_user_memory(username)   # 修复1：首次调用时初始化
             self.auto_sender.start_countdown()
-
-            logger.info(f"[私聊] 收到消息 - 来自: {username}")
-            logger.debug(f"[私聊] 消息内容: {content}")
+            logger.info(f"[私聊] 来自: {sender_name}({username})")
+            logger.debug(f"[私聊] 内容: {content}")
 
             img_path = None
-            is_emoji = False
             is_image_recognition = False
 
-            if content and content.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                img_path = content
-                is_emoji = False
-                content = None
-
-            # 检查动画表情
-            if content and "[动画表情]" in content:
-                img_path = self.emoji_handler.capture_and_save_screenshot(username)
-                is_emoji = True
-                content = None
+            if tg_msg.photo or self._is_image_doc(tg_msg):
+                img_path = self._download_image_sync(tg_msg)
 
             if img_path:
-                recognized_text = self.image_recognition_service.recognize_image(img_path, is_emoji)
-                content = recognized_text if content is None else f"{content} {recognized_text}"
+                recognized_text = self.image_recognition_service.recognize_image(img_path, False)
+                content = recognized_text if not content else f"{content} {recognized_text}"
                 is_image_recognition = True
 
-            # 处理消息
             if content:
                 self.message_handler.handle_user_message(
                     content=content,
-                    chat_id=chat_name,
-                    sender_name=username,
+                    chat_id=tg_msg.chat_id,
+                    sender_name=sender_name,
                     username=username,
                     is_group=False,
                     is_image_recognition=is_image_recognition
                 )
-
         except Exception as e:
             logger.error(f"[私聊] 消息处理失败: {str(e)}")
 
+    def _is_image_doc(self, tg_msg):
+        return (tg_msg.document and tg_msg.document.mime_type and
+                tg_msg.document.mime_type.startswith("image/"))
+
+    def _download_image_sync(self, tg_msg):
+        async def _dl():
+            file_id = tg_msg.photo.file_id if tg_msg.photo else tg_msg.document.file_id
+            f = await self.bot.get_file(file_id)
+            save_dir = os.path.join(root_dir, "temp_images")
+            os.makedirs(save_dir, exist_ok=True)
+            path = os.path.join(save_dir, f"{f.file_id}.jpg")
+            await f.download_to_drive(path)
+            return path
+        return asyncio.run_coroutine_threadsafe(_dl(), self.tg_loop).result(timeout=30)
+
+
+# ── 群聊机器人 ────────────────────────────────────────────────────────────────────
+
 class GroupChatBot:
-    """专门处理群聊的机器人"""
-    def __init__(self, message_handler_class, base_config, auto_sender, emoji_handler, image_recognition_service):
-        # 为群聊创建独立的消息处理器实例
-        self.message_handlers = {}  # 为每个群聊维护独立的处理器
+    """处理 Telegram 群聊消息"""
+
+    def __init__(self, message_handler_class, base_config, auto_sender, emoji_handler,
+                 image_recognition_service, bot: Bot, tg_loop):
+        self.message_handlers = {}
         self.message_handler_class = message_handler_class
         self.base_config = base_config
         self.auto_sender = auto_sender
         self.emoji_handler = emoji_handler
         self.image_recognition_service = image_recognition_service
-        self.wx = WeChat()
-        self.robot_name = self.wx.A_MyIcon.Name
-        logger.info(f"群聊机器人初始化完成 - 机器人名称: {self.robot_name}")
+        self.bot = bot
+        self.tg_loop = tg_loop
+        self.robot_name = getattr(getattr(config, 'bot', None), 'name', 'Bot')
+        logger.info(f"群聊机器人初始化完成 - 名称: {self.robot_name}")
 
-    def get_group_handler(self, group_name, group_config=None):
-        """获取或创建群聊专用的消息处理器"""
-        if group_name not in self.message_handlers:
-            # 为每个群聊创建独立的处理器
-            avatar_path = group_config.avatar if group_config and group_config.avatar else self.base_config.behavior.context.avatar_dir
-            
-            # 读取群聊专用人设内容
+    def get_group_handler(self, group_id: str, group_config=None):
+        if group_id not in self.message_handlers:
+            avatar_path = (group_config.avatar if group_config and group_config.avatar
+                           else self.base_config.behavior.context.avatar_dir)
             full_avatar_path = os.path.join(root_dir, avatar_path)
             prompt_path = os.path.join(full_avatar_path, "avatar.md")
-            group_prompt_content = ""
-            
+
             if os.path.exists(prompt_path):
-                with open(prompt_path, "r", encoding="utf-8") as file:
-                    group_prompt_content = file.read()
+                with open(prompt_path, "r", encoding="utf-8") as f:
+                    group_prompt_content = f.read()
             else:
                 logger.error(f"群聊人设文件不存在: {prompt_path}")
-                group_prompt_content = prompt_content  # 使用默认人设内容作为备选
-            
-            # 创建群聊专用的处理器实例，直接使用正确的人设内容
+                group_prompt_content = prompt_content
+
             handler = self.message_handler_class(
                 root_dir=root_dir,
                 api_key=self.base_config.llm.api_key,
@@ -186,113 +256,110 @@ class GroupChatBot:
                 temperature=self.base_config.llm.temperature,
                 max_groups=self.base_config.behavior.context.max_groups,
                 robot_name=self.robot_name,
-                prompt_content=group_prompt_content,  # 使用正确的群聊人设内容
+                prompt_content=group_prompt_content,
                 image_handler=image_handler,
                 emoji_handler=self.emoji_handler,
                 memory_service=memory_service,
-                content_generator=content_generator
+                content_generator=content_generator,
+                bot=self.bot,
+                tg_loop=self.tg_loop
             )
-            
-            # 手动设置群聊专用属性（避免初始化时使用全局配置）
             handler.current_avatar = os.path.basename(full_avatar_path)
             handler.avatar_real_names = handler._extract_avatar_names(full_avatar_path)
-            
-            self.message_handlers[group_name] = handler
-            logger.info(f"[群聊] 为群聊 '{group_name}' 创建专用处理器，使用人设: {handler.current_avatar}, 识别名字: {handler.avatar_real_names}")
-        
-        return self.message_handlers[group_name]
+            self.message_handlers[group_id] = handler
+            logger.info(f"[群聊] 为群 '{group_id}' 创建专用处理器，人设: {handler.current_avatar}")
 
-    def handle_group_message(self, msg, group_name, group_config=None):
-        """处理群聊消息"""
+        return self.message_handlers[group_id]
+
+    def handle_group_message(self, tg_msg: TelegramMessage, group_config=None):
         try:
-            username = msg.sender
-            content = getattr(msg, 'content', None) or getattr(msg, 'text', None)
+            username = tg_msg.sender
+            sender_name = tg_msg.sender_name
+            group_id = tg_msg.chat_id
+            content = tg_msg.content
 
-            logger.info(f"[群聊] 收到消息 - 群聊: {group_name}, 发送者: {username}")
-            logger.debug(f"[群聊] 消息内容: {content}")
+            logger.info(f"[群聊] 群: {group_id}, 发送者: {sender_name}({username})")
+            logger.debug(f"[群聊] 内容: {content}")
 
-            # 获取群聊专用的处理器
-            handler = self.get_group_handler(group_name, group_config)
+            handler = self.get_group_handler(group_id, group_config)
 
             img_path = None
-            is_emoji = False
             is_image_recognition = False
 
-            # 处理群聊@消息
-            if self.robot_name and content:
-                content = re.sub(f'@{self.robot_name}\u2005', '', content).strip()
+            if content and self.robot_name:
+                content = re.sub(rf'@{re.escape(self.robot_name)}\s*', '', content).strip()
 
-            if content and content.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                img_path = content
-                is_emoji = False
-                content = None
-
-            # 检查动画表情
-            if content and "[动画表情]" in content:
-                img_path = self.emoji_handler.capture_and_save_screenshot(username)
-                is_emoji = True
-                content = None
+            if tg_msg.photo or self._is_image_doc(tg_msg):
+                img_path = self._download_image_sync(tg_msg)
 
             if img_path:
-                recognized_text = self.image_recognition_service.recognize_image(img_path, is_emoji)
-                content = recognized_text if content is None else f"{content} {recognized_text}"
+                recognized_text = self.image_recognition_service.recognize_image(img_path, False)
+                content = recognized_text if not content else f"{content} {recognized_text}"
                 is_image_recognition = True
 
-            # 处理消息
             if content:
                 handler.handle_user_message(
                     content=content,
-                    chat_id=group_name,
-                    sender_name=username,
+                    chat_id=group_id,
+                    sender_name=sender_name,
                     username=username,
                     is_group=True,
                     is_image_recognition=is_image_recognition
                 )
-
         except Exception as e:
             logger.error(f"[群聊] 消息处理失败: {str(e)}")
 
+    def _is_image_doc(self, tg_msg):
+        return (tg_msg.document and tg_msg.document.mime_type and
+                tg_msg.document.mime_type.startswith("image/"))
+
+    def _download_image_sync(self, tg_msg):
+        async def _dl():
+            file_id = tg_msg.photo.file_id if tg_msg.photo else tg_msg.document.file_id
+            f = await self.bot.get_file(file_id)
+            save_dir = os.path.join(root_dir, "temp_images")
+            os.makedirs(save_dir, exist_ok=True)
+            path = os.path.join(save_dir, f"{f.file_id}.jpg")
+            await f.download_to_drive(path)
+            return path
+        return asyncio.run_coroutine_threadsafe(_dl(), self.tg_loop).result(timeout=30)
+
+
+# ── 消息处理线程 ──────────────────────────────────────────────────────────────────
+
 def private_message_processor():
-    """私聊消息处理线程"""
     logger.info("私聊消息处理线程启动")
-    
     while not stop_event.is_set():
         try:
-            # 从队列获取私聊消息
             msg_data = private_message_queue.get(timeout=1)
-            if msg_data is None:  # 退出信号
+            if msg_data is None:
                 break
-                
-            msg, chat_name = msg_data
-            private_chat_bot.handle_private_message(msg, chat_name)
+            private_chat_bot.handle_private_message(msg_data)
             private_message_queue.task_done()
-            
         except queue.Empty:
             continue
         except Exception as e:
             logger.error(f"私聊消息处理线程出错: {str(e)}")
 
+
 def group_message_processor():
-    """群聊消息处理线程"""
     logger.info("群聊消息处理线程启动")
-    
     while not stop_event.is_set():
         try:
-            # 从队列获取群聊消息
             msg_data = group_message_queue.get(timeout=1)
-            if msg_data is None:  # 退出信号
+            if msg_data is None:
                 break
-                
-            msg, group_name, group_config = msg_data
-            group_chat_bot.handle_group_message(msg, group_name, group_config)
+            tg_msg, group_config = msg_data
+            group_chat_bot.handle_group_message(tg_msg, group_config)
             group_message_queue.task_done()
-            
         except queue.Empty:
             continue
         except Exception as e:
             logger.error(f"群聊消息处理线程出错: {str(e)}")
 
-# 全局变量
+
+# ── 全局服务变量 ──────────────────────────────────────────────────────────────────
+
 prompt_content = ""
 emoji_handler = None
 image_handler = None
@@ -303,43 +370,36 @@ image_recognition_service = None
 auto_sender = None
 private_chat_bot = None
 group_chat_bot = None
-ROBOT_WX_NAME = ""
-processed_messages = set()
-last_processed_content = {}
+ROBOT_TG_NAME = ""
+processed_messages = BoundedMessageCache(maxsize=_PROCESSED_MSG_MAX)  # 修复4
 
-def initialize_services():
-    """初始化服务实例"""
+
+def initialize_services(bot: Bot, tg_loop):
+    """初始化所有服务实例"""
     global prompt_content, emoji_handler, image_handler, memory_service, content_generator
-    global message_handler, image_recognition_service, auto_sender, private_chat_bot, group_chat_bot, ROBOT_WX_NAME
+    global message_handler, image_recognition_service, auto_sender
+    global private_chat_bot, group_chat_bot, ROBOT_TG_NAME
 
-    # 尝试获取热更新模块状态信息以确认其状态
+    # 检查热更新模块
     try:
         from src.autoupdate.core.manager import get_manager
-        try:
-            status = get_manager().get_status()
-            if status:
-                print_status(f"热更新模块已就绪", "success", "CHECK")
-            else:
-                print_status("热更新模块状态异常", "warning", "CROSS")
-            
-        except Exception as e:
-            print_status(f"检查热更新模块状态时出现异常: {e}", "error", "ERROR")
-            
+        status = get_manager().get_status()
+        print_status("热更新模块已就绪" if status else "热更新模块状态异常",
+                     "success" if status else "warning",
+                     "CHECK" if status else "CROSS")
     except Exception as e:
         print_status(f"检查热更新模块状态时出现异常: {e}", "error", "ERROR")
 
-    # 读取提示文件
-    avatar_dir = os.path.join(root_dir, config.behavior.context.avatar_dir)
-    prompt_path = os.path.join(avatar_dir, "avatar.md")
+    # 读取人设文件
+    avatar_dir_path = os.path.join(root_dir, config.behavior.context.avatar_dir)
+    prompt_path = os.path.join(avatar_dir_path, "avatar.md")
     if os.path.exists(prompt_path):
-        with open(prompt_path, "r", encoding="utf-8") as file:
-            prompt_content = file.read()
-
-        # 处理无法读取文件的情况
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            prompt_content = f.read()
     else:
         raise FileNotFoundError(f"avatar.md 文件不存在: {prompt_path}")
 
-    # 创建服务实例
+    # 创建各服务实例
     emoji_handler = EmojiHandler(root_dir)
     image_handler = ImageHandler(
         root_dir=root_dir,
@@ -356,7 +416,6 @@ def initialize_services():
         temperature=TEMPERATURE,
         max_groups=MAX_GROUPS
     )
-
     content_generator = ContentGenerator(
         root_dir=root_dir,
         api_key=DEEPSEEK_API_KEY,
@@ -365,7 +424,6 @@ def initialize_services():
         max_token=MAX_TOKEN,
         temperature=TEMPERATURE
     )
-    # 创建图像识别服务
     image_recognition_service = ImageRecognitionService(
         api_key=config.media.image_recognition.api_key,
         base_url=config.media.image_recognition.base_url,
@@ -373,17 +431,22 @@ def initialize_services():
         model=config.media.image_recognition.model
     )
 
-    # 获取机器人名称
+    # 获取 Bot 自身 username
+    async def _get_bot_name():
+        me = await bot.get_me()
+        return me.username or me.first_name
+
     try:
-        wx = WeChat()
-        ROBOT_WX_NAME = wx.A_MyIcon.Name  # 使用Name属性而非方法
-        logger.info(f"获取到机器人名称: {ROBOT_WX_NAME}")
+        ROBOT_TG_NAME = asyncio.run_coroutine_threadsafe(
+            _get_bot_name(), tg_loop
+        ).result(timeout=10)
+        logger.info(f"获取到 Bot 名称: {ROBOT_TG_NAME}")
     except Exception as e:
-        logger.warning(f"获取机器人名称失败: {str(e)}")
-        ROBOT_WX_NAME = ""
+        logger.warning(f"获取 Bot 名称失败: {str(e)}")
+        ROBOT_TG_NAME = ""
 
     # 创建消息处理器
-    message_handler = MessageHandler(
+    message_handler = BotMessageHandler(
         root_dir=root_dir,
         api_key=config.llm.api_key,
         base_url=config.llm.base_url,
@@ -391,408 +454,300 @@ def initialize_services():
         max_token=config.llm.max_tokens,
         temperature=config.llm.temperature,
         max_groups=config.behavior.context.max_groups,
-        robot_name=ROBOT_WX_NAME,  # 使用动态获取的机器人名称
+        robot_name=ROBOT_TG_NAME,
         prompt_content=prompt_content,
         image_handler=image_handler,
         emoji_handler=emoji_handler,
-        memory_service=memory_service,  # 使用新的记忆服务
-        content_generator=content_generator  # 直接传递内容生成器实例
+        memory_service=memory_service,
+        content_generator=content_generator,
+        bot=bot,
+        tg_loop=tg_loop
     )
 
-    # 创建主动消息处理器
-    auto_sender = AutoSendHandler(message_handler, config, listen_list)
+    # 修复2：取第一个群聊 chat_id 作为主动消息默认目标
+    default_chat_id = None
+    if hasattr(config, 'user') and config.user.group_chat_config:
+        first_gc = config.user.group_chat_config[0]
+        if first_gc.group_name:
+            default_chat_id = str(first_gc.group_name)
 
-    # 创建并行聊天机器人实例 
-    private_chat_bot = PrivateChatBot(message_handler, image_recognition_service, auto_sender, emoji_handler)
-    group_chat_bot = GroupChatBot(MessageHandler, config, auto_sender, emoji_handler, image_recognition_service)
+    auto_sender = AutoSendHandler(
+        message_handler,
+        config,
+        default_chat_id=default_chat_id   # 修复2：传入默认发送目标
+    )
 
-    # 启动主动消息倒计时
+    private_chat_bot = PrivateChatBot(
+        message_handler, image_recognition_service, auto_sender,
+        emoji_handler, bot, tg_loop,
+        memory_service_ref=memory_service  # 修复1：传入 memory_service
+    )
+    group_chat_bot = GroupChatBot(
+        BotMessageHandler, config, auto_sender, emoji_handler,
+        image_recognition_service, bot, tg_loop
+    )
+
     auto_sender.start_countdown()
 
-def message_dispatcher():
-    """消息分发器 - 将消息分发到对应的处理队列"""
-    global ROBOT_WX_NAME, logger, wait, processed_messages, last_processed_content
 
-    wx = None
-    last_window_check = 0
-    check_interval = 600
+# ── PTB 异步 Handler ──────────────────────────────────────────────────────────────
 
-    logger.info("消息分发器启动")
+async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bot 已就绪，请开始对话。")
 
-    while not stop_event.is_set():
-        try:
-            current_time = time.time()
 
-            if wx is None or (current_time - last_window_check > check_interval):
-                wx = WeChat()
-                if not wx.GetSessionList():
-                    time.sleep(5)
-                    continue
-                last_window_check = current_time
+async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """私聊消息回调：无白名单限制，所有私聊均响应"""
+    tg_msg = TelegramMessage(update)
+    msg_key = f"{tg_msg.chat_id}_{tg_msg.id}"
+    if msg_key in processed_messages:
+        return
+    processed_messages.add(msg_key)
+    logger.debug(f"[分发] 私聊 -> 私聊队列: {tg_msg.chat_id}")
+    private_message_queue.put(tg_msg)
 
-            msgs = wx.GetListenMessage()
-            if not msgs:
-                time.sleep(wait)
+
+async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """群聊消息回调：根据触发条件决定是否响应"""
+    tg_msg = TelegramMessage(update)
+    chat_id = tg_msg.chat_id
+    content = tg_msg.content
+
+    msg_key = f"{chat_id}_{tg_msg.id}"
+    if msg_key in processed_messages:
+        return
+    processed_messages.add(msg_key)
+
+    should_respond = False
+    trigger_reason = ""
+    group_config = None
+
+    # 1. 检查群聊配置触发词
+    if config and hasattr(config, 'user') and config.user.group_chat_config:
+        for gc_config in config.user.group_chat_config:
+            raw = str(gc_config.group_name).strip()
+            # 修复3：跳过非数字 ID 的配置项并给出警告
+            if not raw.lstrip('-').isdigit():
+                logger.warning(
+                    f"群聊配置 group_name='{raw}' 不是有效的数字 ID，已跳过。"
+                    "请填写 Telegram 群聊的数字 ID（通常以 -100 开头）。"
+                )
                 continue
+            if raw == chat_id:
+                group_config = gc_config
+                for trigger in gc_config.triggers:
+                    if trigger and trigger in content:
+                        trigger_reason = f"群聊触发词({trigger})"
+                        should_respond = True
+                        break
+                break
 
-            for chat in msgs:
-                who = chat.who
-                if not who:
-                    continue
+    # 2. 检查 @Bot mention
+    if not should_respond:
+        at_enabled = group_config.enable_at_trigger if group_config is not None else True
+        if at_enabled and ROBOT_TG_NAME and f"@{ROBOT_TG_NAME}" in content:
+            trigger_reason = f"被@了Bot({ROBOT_TG_NAME})"
+            should_respond = True
 
-                one_msgs = msgs.get(chat)
-                if not one_msgs:
-                    continue
+    # 3. 检查人设名字
+    if not should_respond and group_config:
+        temp_handler = group_chat_bot.get_group_handler(chat_id, group_config)
+        if hasattr(temp_handler, 'avatar_real_names'):
+            for name in temp_handler.avatar_real_names:
+                if name and name in content:
+                    trigger_reason = f"提到了群聊人设名字({name})"
+                    should_respond = True
+                    break
 
-                for msg in one_msgs:
-                    try:
-                        msg_id = getattr(msg, 'id', None)
-                        msgtype = msg.type
-                        content = msg.content
-                        
-                        if msg_id and msg_id in processed_messages:
-                            logger.debug(f"跳过已处理的消息ID: {msg_id}")
-                            continue
-                        if not content:
-                            continue
-                        if msgtype != 'friend':
-                            logger.debug(f"非好友消息，忽略! 消息类型: {msgtype}")
-                            continue
-                        
-                        # 检查消息来源是否在监听列表中
-                        if who not in listen_list:
-                            logger.debug(f"消息来源不在监听列表中，忽略: {who}")
-                            continue
-                        
-                        if msg_id:
-                            processed_messages.add(msg_id)
-                        last_processed_content[who] = content            
-                            
-                        # 接收窗口名跟发送人一样，代表是私聊，否则是群聊
-                        if who == msg.sender:
-                            # 私聊消息 - 放入私聊队列
-                            logger.debug(f"[分发] 私聊消息 -> 私聊队列: {who}")
-                            private_message_queue.put((msg, msg.sender))
-                        else:
-                            # 群聊消息 - 检查触发条件后放入群聊队列
-                            trigger_reason = ""
-                            should_respond = False
-                            group_config = None
-                            
-                            # 导入配置
-                            from data.config import config
-                            
-                            # 首先检查群聊配置
-                            if config and hasattr(config, 'user') and config.user.group_chat_config:
-                                for gc_config in config.user.group_chat_config:
-                                    if gc_config.group_name == who:  # who 是群聊名称
-                                        group_config = gc_config
-                                        # 检查群聊配置中的触发词
-                                        for trigger in gc_config.triggers:
-                                            if trigger and trigger in msg.content:
-                                                trigger_reason = f"群聊配置触发词({trigger})"
-                                                should_respond = True
-                                                break
-                                        break
-                            
-                            # 如果没有找到群聊配置或没有触发，使用默认逻辑
-                            if not should_respond:
-                                # 检查@机器人名字
-                                at_trigger_enabled = True  # 默认启用
-                                if group_config is not None:
-                                    at_trigger_enabled = group_config.enable_at_trigger
-                                
-                                if at_trigger_enabled and ROBOT_WX_NAME and bool(re.search(f'@{ROBOT_WX_NAME}\u2005', msg.content)):
-                                    trigger_reason = f"被@了机器人名字({ROBOT_WX_NAME})"
-                                    should_respond = True
-                                # 检查群聊的人设名字（获取当前群聊的专用处理器）
-                                elif group_config:
-                                    # 临时获取群聊处理器来检查人设名字
-                                    temp_handler = group_chat_bot.get_group_handler(who, group_config)
-                                    if hasattr(temp_handler, 'avatar_real_names'):
-                                        for name in temp_handler.avatar_real_names:
-                                            if name and name in msg.content:
-                                                trigger_reason = f"提到了群聊人设名字({name})"
-                                                should_respond = True
-                                                break
-                            
-                            if should_respond:
-                                logger.debug(f"[分发] 群聊消息触发响应 - 原因: {trigger_reason} -> 群聊队列: {who}")
-                                group_message_queue.put((msg, who, group_config))
-                            else:
-                                logger.debug(f"群聊消息未触发响应 - 群聊:{who}, 内容: {content}")
-                                
-                    except Exception as e:
-                        logger.debug(f"分发单条消息失败: {str(e)}")
-                        continue
+    if should_respond:
+        logger.debug(f"[分发] 群聊触发响应 - 原因: {trigger_reason} -> 群聊队列: {chat_id}")
+        group_message_queue.put((tg_msg, group_config))
+    else:
+        logger.debug(f"群聊消息未触发响应 - 群: {chat_id}, 内容: {content}")
 
-        except Exception as e:
-            logger.debug(f"消息分发出错: {str(e)}")
-            wx = None
-        time.sleep(wait)
 
-def initialize_wx_listener():
-    """
-    初始化微信监听，包含重试机制
-    """
-    # 使用全局变量
-    global listen_list, logger
+# ── 自动任务 ──────────────────────────────────────────────────────────────────────
 
-    max_retries = 3
-    retry_delay = 2  # 秒
-
-    for attempt in range(max_retries):
-        try:
-            wx = WeChat()
-            if not wx.GetSessionList():
-                logger.error("未检测到微信会话列表，请确保微信已登录")
-                time.sleep(retry_delay)
-                continue
-
-            # 循环添加监听对象，设置保存图片和语音消息
-            for chat_name in listen_list:
-                try:
-                    # 先检查会话是否存在
-                    if not wx.ChatWith(chat_name):
-                        logger.error(f"找不到会话: {chat_name}")
-                        continue
-
-                    # 尝试添加监听，设置savepic=True, savevoice=True
-                    wx.AddListenChat(who=chat_name, savepic=True, savevoice=True)
-                    logger.info(f"成功添加监听: {chat_name}")
-                    time.sleep(0.5)  # 添加短暂延迟，避免操作过快
-                except Exception as e:
-                    logger.error(f"添加监听失败 {chat_name}: {str(e)}")
-                    continue
-
-            return wx
-
-        except Exception as e:
-            logger.error(f"初始化微信失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-            else:
-                raise Exception("微信初始化失败，请检查微信是否正常运行")
-
-    return None
-
-def initialize_auto_tasks(message_handler):
-    """初始化自动任务系统"""
+def initialize_auto_tasks(msg_handler):
     print_status("初始化自动任务系统...", "info", "CLOCK")
-
     try:
-        # 导入config变量
-        from data.config import config
-
-        # 创建AutoTasker实例
-        auto_tasker = AutoTasker(message_handler)
-        print_status("创建AutoTasker实例成功", "success", "CHECK")
-
-        # 清空现有任务
+        auto_tasker = AutoTasker(msg_handler)
+        print_status("创建 AutoTasker 实例成功", "success", "CHECK")
         auto_tasker.scheduler.remove_all_jobs()
-        print_status("清空现有任务", "info", "CLEAN")
 
-        # 从配置文件读取任务信息
         if hasattr(config, 'behavior') and hasattr(config.behavior, 'schedule_settings'):
             schedule_settings = config.behavior.schedule_settings
-            if schedule_settings and schedule_settings.tasks:  # 直接检查 tasks 列表
+            if schedule_settings and schedule_settings.tasks:
                 tasks = schedule_settings.tasks
-                if tasks:
-                    print_status(f"从配置文件读取到 {len(tasks)} 个任务", "info", "TASK")
-                    tasks_added = 0
-
-                    # 遍历所有任务并添加
-                    for task in tasks:
-                        try:
-                            # 添加定时任务
-                            auto_tasker.add_task(
-                                task_id=task.task_id,
-                                chat_id=listen_list[0],  # 使用 listen_list 中的第一个聊天ID
-                                content=task.content,
-                                schedule_type=task.schedule_type,
-                                schedule_time=task.schedule_time
-                            )
-                            tasks_added += 1
-                            print_status(f"成功添加任务 {task.task_id}: {task.content}", "success", "CHECK")
-                        except Exception as e:
-                            print_status(f"添加任务 {task.task_id} 失败: {str(e)}", "error", "ERROR")
-
-                    print_status(f"成功添加 {tasks_added}/{len(tasks)} 个任务", "info", "TASK")
-                else:
-                    print_status("配置文件中没有找到任务", "warning", "WARNING")
+                print_status(f"从配置文件读取到 {len(tasks)} 个任务", "info", "TASK")
+                tasks_added = 0
+                for task in tasks:
+                    try:
+                        auto_tasker.add_task(
+                            task_id=task.task_id,
+                            chat_id=task.chat_id,
+                            content=task.content,
+                            schedule_type=task.schedule_type,
+                            schedule_time=task.schedule_time
+                        )
+                        tasks_added += 1
+                        print_status(f"成功添加任务 {task.task_id}: {task.content}", "success", "CHECK")
+                    except Exception as e:
+                        print_status(f"添加任务 {task.task_id} 失败: {str(e)}", "error", "ERROR")
+                print_status(f"成功添加 {tasks_added}/{len(tasks)} 个任务", "info", "TASK")
+            else:
+                print_status("配置文件中没有找到任务", "warning", "WARNING")
         else:
             print_status("未找到任务配置信息", "warning", "WARNING")
-            print_status(f"当前 behavior 属性: {dir(config.behavior)}", "info", "INFO")
 
         return auto_tasker
-
     except Exception as e:
         print_status(f"初始化自动任务系统失败: {str(e)}", "error", "ERROR")
-        logger.error(f"初始化自动任务系统失败: {str(e)}")
+        if logger:
+            logger.error(f"初始化自动任务系统失败: {str(e)}")
         return None
 
+
 def switch_avatar(new_avatar_name):
-    # 使用全局变量
-    global emoji_handler, private_chat_bot, group_chat_bot, root_dir
+    global emoji_handler, private_chat_bot, group_chat_bot
 
-    # 导入config变量
-    from data.config import config
-
-    # 更新配置
     config.behavior.context.avatar_dir = f"avatars/{new_avatar_name}"
-
-    # 重新初始化 emoji_handler
     emoji_handler = EmojiHandler(root_dir)
 
-    # 更新私聊和群聊机器人中的 emoji_handler
     if private_chat_bot:
         private_chat_bot.emoji_handler = emoji_handler
         private_chat_bot.message_handler.emoji_handler = emoji_handler
-    
+
     if group_chat_bot:
         group_chat_bot.emoji_handler = emoji_handler
-        # 更新所有群聊的emoji_handler
-        for group_handler in group_chat_bot.message_handlers.values():
-            group_handler.emoji_handler = emoji_handler
+        for gh in group_chat_bot.message_handlers.values():
+            gh.emoji_handler = emoji_handler
+
+
+# ── 主函数 ────────────────────────────────────────────────────────────────────────
 
 def main():
-    # 初始化变量
-    dispatcher_thread = None
     private_thread = None
     group_thread = None
 
     try:
-        # 初始化日志系统
         initialize_logging()
 
-        # 初始化服务实例
-        initialize_services()
-
-        # 设置wxauto日志路径
-        automation_log_dir = os.path.join(root_dir, "logs", "automation")
-        if not os.path.exists(automation_log_dir):
-            os.makedirs(automation_log_dir)
-        os.environ["WXAUTO_LOG_PATH"] = os.path.join(automation_log_dir, "AutomationLog.txt")
-
-        # 初始化微信监听
-        print_status("初始化微信监听...", "info", "BOT")
-        wx = initialize_wx_listener()
-        if not wx:
-            print_status("微信初始化失败，请确保微信已登录并保持在前台运行!", "error", "CROSS")
-            return
-        print_status("微信监听初始化完成", "success", "CHECK")
-
-        # 验证记忆目录
-        print_status("验证角色记忆存储路径...", "info", "FILE")
-        avatar_dir = os.path.join(root_dir, config.behavior.context.avatar_dir)
-        avatar_name = os.path.basename(avatar_dir)
-        memory_dir = os.path.join(avatar_dir, "memory")
-        if not os.path.exists(memory_dir):
-            os.makedirs(memory_dir)
-            print_status(f"创建角色记忆目录: {memory_dir}", "success", "CHECK")
-
-        # 初始化记忆文件 - 为每个监听用户创建独立的记忆文件
-        print_status("初始化记忆文件...", "info", "FILE")
-
-        # 为每个监听的用户创建独立记忆
-        for user_name in listen_list:
-            print_status(f"为用户 '{user_name}' 创建独立记忆...", "info", "USER")
-            # 使用用户名作为用户ID
-            memory_service.initialize_memory_files(avatar_name, user_id=user_name)
-            print_status(f"用户 '{user_name}' 记忆初始化完成", "success", "CHECK")
-
-        avatar_dir = os.path.join(root_dir, config.behavior.context.avatar_dir)
-        prompt_path = os.path.join(avatar_dir, "avatar.md")
-        if not os.path.exists(prompt_path):
-            with open(prompt_path, "w", encoding="utf-8") as f:
-                f.write("# 核心人格\n[默认内容]")
-            print_status(f"创建人设提示文件", "warning", "WARNING")
-        # 启动并行消息处理系统
-        print_status("启动并行消息处理系统...", "info", "ANTENNA")
-        
-        # 启动消息分发线程
-        dispatcher_thread = threading.Thread(target=message_dispatcher, name="MessageDispatcher")
-        dispatcher_thread.daemon = True
-        
-        # 启动私聊处理线程
-        private_thread = threading.Thread(target=private_message_processor, name="PrivateProcessor")
-        private_thread.daemon = True
-        
-        # 启动群聊处理线程
-        group_thread = threading.Thread(target=group_message_processor, name="GroupProcessor")
-        group_thread.daemon = True
-        
-        # 启动所有线程
-        dispatcher_thread.start()
-        private_thread.start()
-        group_thread.start()
-        
-        print_status("并行消息处理系统已启动", "success", "CHECK")
-        print_status("  ├─ 消息分发器线程", "info", "ANTENNA")
-        print_status("  ├─ 私聊处理器线程", "info", "USER")
-        print_status("  └─ 群聊处理器线程", "info", "USERS")
-
-        # 初始化主动消息系统
-        print_status("初始化主动消息系统...", "info", "CLOCK")
-        print_status("主动消息系统已启动", "success", "CHECK")
-
-        print("-" * 50)
-        print_status("系统初始化完成", "success", "STAR_2")
-        print("=" * 50)
-
-        # 初始化自动任务系统
-        auto_tasker = initialize_auto_tasks(message_handler)
-        if not auto_tasker:
-            print_status("自动任务系统初始化失败", "error", "ERROR")
+        tg_token = (getattr(getattr(config, 'bot', None), 'token', None) or
+                    os.environ.get("TELEGRAM_BOT_TOKEN", ""))
+        if not tg_token:
+            print_status(
+                "未配置 Telegram Bot Token！"
+                "请在配置文件 config.bot.token 或环境变量 TELEGRAM_BOT_TOKEN 中设置",
+                "error", "CROSS"
+            )
             return
 
-        # 主循环 - 监控并行处理线程状态
-        while True:
-            time.sleep(1)
-            
-            # 检查关键线程状态
-            threads_status = [
-                ("消息分发器", dispatcher_thread),
-                ("私聊处理器", private_thread),
-                ("群聊处理器", group_thread)
-            ]
-            
-            dead_threads = []
-            for thread_name, thread in threads_status:
-                if not thread.is_alive():
-                    dead_threads.append(thread_name)
-            
-            if dead_threads:
-                print_status(f"检测到线程异常: {', '.join(dead_threads)}", "warning", "WARNING")
-                # 这里可以添加重启逻辑，暂时先记录
-                time.sleep(5)
+        # 获取代理配置
+        proxy_url = getattr(getattr(config, 'bot', None), 'proxy_url', None)
+        if proxy_url:
+            application = ApplicationBuilder().token(tg_token).proxy_url(proxy_url).build()
+            logger.info(f"使用代理: {proxy_url}")
+        else:
+            application = ApplicationBuilder().token(tg_token).build()
+
+        # 注册 Handler
+        application.add_handler(CommandHandler("start", on_start))
+        application.add_handler(
+            TGMessageHandler(
+                filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO | filters.Document.IMAGE),
+                on_private_message
+            )
+        )
+        application.add_handler(
+            TGMessageHandler(
+                (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP) &
+                (filters.TEXT | filters.PHOTO | filters.Document.IMAGE),
+                on_group_message
+            )
+        )
+
+        # post_init：在 PTB 内部 event loop 就绪后执行初始化
+        async def post_init(app: Application):
+            nonlocal private_thread, group_thread
+
+            tg_loop = asyncio.get_event_loop()
+            print_status("初始化服务实例...", "info", "BOT")
+            initialize_services(app.bot, tg_loop)
+            print_status("服务实例初始化完成", "success", "CHECK")
+
+            # 验证记忆目录
+            avatar_dir_path = os.path.join(root_dir, config.behavior.context.avatar_dir)
+            avatar_name = os.path.basename(avatar_dir_path)
+            os.makedirs(os.path.join(avatar_dir_path, "memory"), exist_ok=True)
+
+            # 修复5：仅初始化已配置群聊的记忆（私聊用户改为动态初始化，见 PrivateChatBot._ensure_user_memory）
+            print_status("初始化群聊记忆文件...", "info", "FILE")
+            configured_chat_ids = set()
+            if hasattr(config, 'user') and config.user.group_chat_config:
+                for gc in config.user.group_chat_config:
+                    raw = str(gc.group_name).strip()
+                    if raw.lstrip('-').isdigit():   # 修复3：与 on_group_message 保持一致，跳过非数字
+                        configured_chat_ids.add(raw)
+            for cid in configured_chat_ids:
+                memory_service.initialize_memory_files(avatar_name, user_id=cid)
+                print_status(f"群聊 '{cid}' 记忆初始化完成", "success", "CHECK")
+
+            # 确保人设文件存在
+            prompt_path = os.path.join(avatar_dir_path, "avatar.md")
+            if not os.path.exists(prompt_path):
+                with open(prompt_path, "w", encoding="utf-8") as f:
+                    f.write("# 核心人格\n[默认内容]")
+                print_status("创建人设提示文件", "warning", "WARNING")
+
+            # 启动并行消息处理线程
+            print_status("启动并行消息处理系统...", "info", "ANTENNA")
+            private_thread = threading.Thread(
+                target=private_message_processor, name="PrivateProcessor", daemon=True
+            )
+            group_thread = threading.Thread(
+                target=group_message_processor, name="GroupProcessor", daemon=True
+            )
+            private_thread.start()
+            group_thread.start()
+            print_status("并行消息处理系统已启动", "success", "CHECK")
+            print_status("  ├─ 私聊处理器线程", "info", "USER")
+            print_status("  └─ 群聊处理器线程", "info", "USERS")
+
+            # 初始化自动任务
+            auto_tasker = initialize_auto_tasks(message_handler)
+            if not auto_tasker:
+                print_status("自动任务系统初始化失败", "error", "ERROR")
+
+            print("-" * 50)
+            print_status("系统初始化完成，开始监听 Telegram 消息...", "success", "STAR_2")
+            print("=" * 50)
+
+        application.post_init = post_init
+
+        # 启动 Bot（阻塞直到收到停止信号）
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
 
     except Exception as e:
         print_status(f"主程序异常: {str(e)}", "error", "ERROR")
-        logger.error(f"主程序异常: {str(e)}", exc_info=True)
+        if logger:
+            logger.error(f"主程序异常: {str(e)}", exc_info=True)
     finally:
-        # 清理资源
-        if 'auto_sender' in locals():
-            auto_sender.stop()
+        if auto_sender is not None:
+            try:
+                auto_sender.stop()
+            except Exception:
+                pass
 
-        # 设置事件以停止线程
         stop_event.set()
 
-        # 向队列发送退出信号
         try:
             private_message_queue.put(None)
             group_message_queue.put(None)
-        except:
+        except Exception:
             pass
 
-        # 等待所有处理线程结束
-        threads_to_wait = [
-            ("消息分发器", dispatcher_thread),
-            ("私聊处理器", private_thread),
-            ("群聊处理器", group_thread)
-        ]
-        
-        for thread_name, thread in threads_to_wait:
+        for thread_name, thread in [("私聊处理器", private_thread), ("群聊处理器", group_thread)]:
             if thread and thread.is_alive():
                 print_status(f"正在关闭{thread_name}线程...", "info", "SYNC")
                 thread.join(timeout=3)
@@ -802,6 +757,7 @@ def main():
         print_status("正在关闭系统...", "warning", "STOP")
         print_status("系统已退出", "info", "BYE")
         print("\n")
+
 
 if __name__ == '__main__':
     try:

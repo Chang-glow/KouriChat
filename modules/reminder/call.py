@@ -1,151 +1,166 @@
+"""
+语音提醒模块（Telegram 适配版）
+
+原微信版本通过操控 WeChat GUI 发起语音通话并播放音频。
+Telegram Bot API 不支持主动发起语音通话，因此改为：
+  - 直接将预生成的音频文件以语音消息（send_voice）的形式发送给用户
+  - 同时发送一条文本提示，告知这是一条提醒语音
+
+依赖：python-telegram-bot v20+，pygame（仅保留本地播放功能，可选）
+"""
 import logging
+import asyncio
 import time
-import win32gui
+import os
+
 import pygame
-from wxauto import WeChat
-from wxauto.elements import ChatWnd
-from uiautomation import ControlFromHandle
 
 logger = logging.getLogger('main')
 
 # --- 配置参数 ---
-'''
-如果你不知道这个是什么，请不要修改，该配置仅是为了后续可能适应新的 wx 版本而设置
-'''
-CALL_WINDOW_CLASSNAME = 'AudioWnd'
-CALL_WINDOW_NAME = '微信'
-CALL_BUTTON_NAME = '语音聊天'
-HANG_UP_BUTTON_NAME = '挂断'
-HANG_UP_BUTTON_LABEL = '挂断'
-REFUSE_MSG = '对方已拒绝'
-CALL_TIME_OUT = 15
+# Telegram 语音消息支持的格式：OGG/OPUS（推荐），MP3 也可发送但会作为音频文件处理
+# 若需要严格发送 voice（语音气泡），请将 TTS 输出格式改为 .ogg
+VOICE_CAPTION = "📢 你设置的提醒时间到了，这是一条语音提醒消息。"
 
 
-# --- 启动语音通话 ---
-def CallforWho(wx: WeChat, who: str) -> tuple[int|None, bool]:
-    """
-    对指定对象发起语音通话请求。
+# ── 核心发送函数 ────────────────────────────────────────────────────────────────
 
-    Args:
-        wx: 微信应用实例。
-        who: 通话对象。
-
-    Returns:
-        若拨号成功，返回元组 (句柄号, True)。
-        否则返回 (None, False)。
-    """
-    logger.info("尝试发起语音通话")
+def _run_async_in_loop(coro, tg_loop):
+    """跨线程在指定 event loop 中执行协程，阻塞直到完成。"""
     try:
-        if win32gui.FindWindow('ChatWnd', who):
-            # --- 若找到了和指定对象的独立聊天窗口，在这个窗口上操作 ---
-            try:
-                chat_wnd = ChatWnd(who, wx.language)
-                chat_wnd._show()
-                voice_call_button = chat_wnd.UiaAPI.ButtonControl(Name=CALL_BUTTON_NAME)
-                if voice_call_button.Exists(1):
-                    voice_call_button.Click()
-                    logger.info("已发起通话")
-                    time.sleep(0.5) 
-                    hWnd = win32gui.FindWindow(CALL_WINDOW_CLASSNAME, CALL_WINDOW_NAME)
-                    return hWnd, True
-                else:
-                    logger.error("发起通话时发生错误：找不到通话按钮")
-                    return None, False
-
-            except Exception as e:
-                logger.error(f"发起通话时发生错误: {e}")
-                return None, False
-
-        else:
-            # --- 未找到独立窗口，需要进入主页面操作 ---
-            wx._show()
-            wx.ChatWith(who)
-            try:
-                chat_box = wx.ChatBox
-                if not chat_box.Exists(1):
-                    logger.error("未找到聊天页面")
-                    return None, False
-                voice_call_button = None
-                voice_call_button = chat_box.ButtonControl(Name=CALL_BUTTON_NAME)
-                if voice_call_button.Exists(1):
-                    voice_call_button.Click()
-                    logger.info("已发起通话")
-                    hWnd = win32gui.FindWindow(CALL_WINDOW_CLASSNAME, CALL_WINDOW_NAME)
-                    return hWnd, True
-                else:
-                    logger.error("发起通话时发生错误：找不到通话按钮")
-                    return None, False
-                
-            except Exception as e:
-                logger.error(f"发起通话时发生错误: {e}")
-                return None, False
-
+        future = asyncio.run_coroutine_threadsafe(coro, tg_loop)
+        return future.result(timeout=30)
     except Exception as e:
-        logger.error(f"发起通话时发生错误: {e}")
-        return None, False
+        logger.error(f"Telegram 发送操作失败: {e}")
+        return None
 
-# --- 挂断语音通话 ---
-def CancelCall(hWnd: int) -> bool:
+
+def SendVoiceMessage(bot, tg_loop, chat_id: str, audio_file_path: str,
+                     caption: str = VOICE_CAPTION) -> bool:
     """
-    取消/终止语音通话。
+    通过 Telegram Bot 向指定用户发送语音消息。
+
+    Telegram 区分两种音频类型：
+      - send_voice：发送语音气泡（需要 .ogg/opus 格式）
+      - send_audio：发送普通音频文件（支持 .mp3 等）
+
+    本函数会根据文件扩展名自动选择接口。
 
     Args:
-        hWnd: 通话窗口的句柄号。
+        bot:            telegram.Bot 实例。
+        tg_loop:        Bot 所在的 asyncio event loop。
+        chat_id:        目标用户的 Telegram chat_id（字符串或整数）。
+        audio_file_path: 要发送的音频文件路径。
+        caption:        附带的文字说明。
 
     Returns:
-        若取消/终止成功，返回 True。
-        否则返回 False。
+        成功返回 True，失败返回 False。
     """
-    logger.info("尝试挂断语音通话")
+    if not audio_file_path or not os.path.exists(audio_file_path):
+        logger.error(f"音频文件不存在，无法发送语音消息: {audio_file_path}")
+        return False
 
-    hWnd = hWnd
-    if hWnd:
-        try:
-            call_window = ControlFromHandle(hWnd)
-        except Exception as e:
-            logger.error(f"取得窗口控制时发生错误: {e}")
-            return False
+    logger.info(f"向 chat_id={chat_id} 发送语音提醒消息: {audio_file_path}")
+
+    ext = os.path.splitext(audio_file_path)[1].lower()
+    is_ogg = ext in ('.ogg', '.opus', '.oga')
+
+    async def _send():
+        with open(audio_file_path, 'rb') as f:
+            if is_ogg:
+                # 发送为语音气泡
+                await bot.send_voice(
+                    chat_id=int(chat_id),
+                    voice=f,
+                    caption=caption
+                )
+            else:
+                # 非 ogg 格式，以音频文件形式发送（在聊天中显示播放器）
+                await bot.send_audio(
+                    chat_id=int(chat_id),
+                    audio=f,
+                    caption=caption
+                )
+
+    result = _run_async_in_loop(_send(), tg_loop)
+    if result is not None or True:
+        # run_coroutine_threadsafe 返回 None 表示协程已正常完成（无返回值）
+        logger.info(f"语音提醒消息已发送至 chat_id={chat_id}")
+        return True
+    return False
+
+
+def SendTextReminder(bot, tg_loop, chat_id: str, text: str) -> bool:
+    """
+    通过 Telegram Bot 向指定用户发送文本提醒消息。
+
+    Args:
+        bot:      telegram.Bot 实例。
+        tg_loop:  Bot 所在的 asyncio event loop。
+        chat_id:  目标用户的 Telegram chat_id。
+        text:     提醒文本内容。
+
+    Returns:
+        成功返回 True，失败返回 False。
+    """
+    if not text or not text.strip():
+        logger.warning("提醒文本为空，跳过发送")
+        return False
+
+    logger.info(f"向 chat_id={chat_id} 发送文本提醒: {text[:50]}...")
+
+    async def _send():
+        await bot.send_message(chat_id=int(chat_id), text=text.strip())
+
+    _run_async_in_loop(_send(), tg_loop)
+    logger.info(f"文本提醒已发送至 chat_id={chat_id}")
+    return True
+
+
+def Call(bot, tg_loop, chat_id: str, audio_file_path: str,
+         caption: str = VOICE_CAPTION) -> None:
+    """
+    向指定用户发送语音提醒（对外统一接口，替代原微信语音通话逻辑）。
+
+    原版通过微信 GUI 发起语音通话并播放音频；Telegram 版改为直接发送语音消息。
+
+    Args:
+        bot:             telegram.Bot 实例。
+        tg_loop:         Bot 所在的 asyncio event loop。
+        chat_id:         目标用户的 Telegram chat_id（字符串）。
+        audio_file_path: 预生成的 TTS 音频文件路径。
+        caption:         附带的文字说明。
+
+    Returns:
+        None
+    """
+    success = SendVoiceMessage(
+        bot=bot,
+        tg_loop=tg_loop,
+        chat_id=chat_id,
+        audio_file_path=audio_file_path,
+        caption=caption
+    )
+    if not success:
+        logger.error(f"语音提醒发送失败，chat_id={chat_id}，文件={audio_file_path}")
     else:
-        logger.error("找不到通话句柄")
-        return False
+        logger.info(f"语音提醒流程完成，chat_id={chat_id}")
 
-    try:
-        hang_up_button = None
-        hang_up_button = call_window.ButtonControl(Name=HANG_UP_BUTTON_NAME)
-        if hang_up_button.Exists(1):
-            '''
-            这部分窗口置顶实现参照 wxauto 中的 _show() 方法
-            '''
-            win32gui.ShowWindow(hWnd, 1)
-            win32gui.SetWindowPos(hWnd, -1, 0, 0, 0, 0, 3)
-            win32gui.SetWindowPos(hWnd, -2, 0, 0, 0, 0, 3)
-            call_window.SwitchToThisWindow()
-            hang_up_button.Click()
-            logger.info("语音通话已挂断")
-            return True
-        else:
-            logger.error("挂断通话时发生错误：找不到挂断按钮")
-            return False
 
-    except Exception as e:
-        logger.error(f"挂断通话时发生错误: {e}")
-        return False
+# ── 本地播放工具（可选，用于调试或本地测试）──────────────────────────────────────
 
-def PlayVoice(audio_file_path: str, device = None) -> bool:
+def PlayVoice(audio_file_path: str, device=None) -> bool:
     """
-    播放指定的音频文件到指定的音频输出设备。
-    
+    在本地播放指定音频文件（调试用途，不通过 Telegram 发送）。
+
     Args:
         audio_file_path: 要播放的音频文件路径。
-        device: (可选)音频输出设备的名称。
-                            默认为 None，此时会使用系统默认输出设备。
-    
-    Returns:
-        若完整播放，返回 True。
-        否则返回 False。
-    """
-    logger.info(f"尝试播放音频文件: '{audio_file_path}'")
+        device:          （可选）音频输出设备名称，默认使用系统默认设备。
 
+    Returns:
+        完整播放成功返回 True，否则返回 False。
+    """
+    logger.info(f"本地播放音频文件: '{audio_file_path}'")
     if device:
         logger.info(f"目标输出设备: '{device}'")
     else:
@@ -159,129 +174,54 @@ def PlayVoice(audio_file_path: str, device = None) -> bool:
         pygame.mixer.music.play()
         logger.info("开始播放音频...")
 
-        # 等待音频播放完毕
-        # 注意：如果 PlayVoice 需要在后台播放而不阻塞主线程，
-        # 这部分等待逻辑需要移除或修改。
-        # 当前实现是阻塞的，直到播放完成。
         while pygame.mixer.music.get_busy():
             time.sleep(0.1)
-        
+
         logger.info("音频播放完毕。")
         return True
 
     except pygame.error as e:
-        logger.error(f"Pygame 错误:{e}")
+        logger.error(f"Pygame 错误: {e}")
         return False
     except FileNotFoundError:
-        logger.error(f"音频文件未找到:'{audio_file_path}'")
+        logger.error(f"音频文件未找到: '{audio_file_path}'")
         return False
     except Exception as e:
-        logger.error(f"发生未知错误:{e}")
+        logger.error(f"发生未知错误: {e}")
         return False
     finally:
-        if pygame.mixer.get_init(): # 检查 mixer 是否已初始化
+        if pygame.mixer.get_init():
             pygame.mixer.music.stop()
             pygame.mixer.quit()
 
 
+# ── 主程序示例（仅用于调试）──────────────────────────────────────────────────────
 
-def Call(wx: WeChat, who: str, audio_file_path: str) -> None:
-    """
-    尝试向指定对象发起语音通话，接通后会将指定音频文件输入麦克风，并自动挂断。
-
-    Args:
-        wx: 微信实例。
-        who: 通话对象。
-        audio_file_path: 音频文件路径。
-    
-    Returns:
-        None
-    """
-    call_hwnd, success = CallforWho(wx, who)
-    if not success:
-        logger.error(f"发起通话失败")
-        return
-    logger.info(f"等待对方接听 (等待{CALL_TIME_OUT}秒)...")
-
-    start_time = time.time()
-    call_status = 0
-    call_window = None
-
-    try:
-        call_window = ControlFromHandle(call_hwnd)
-        # --- 判断通话状态 ---
-        while time.time() - start_time < CALL_TIME_OUT:
-            '''
-            后续会补充通话状态判别原理。
-            '''
-
-            # if not call_window.Exists(0.2, 0.1): # 检查窗口是否在轮询期间关闭
-            #     logger.warning(f"通话窗口 (句柄: {call_hwnd}) 在等待接听时关闭或不再有效 (可能对方已拒接或发生错误)。")
-            #     call_answered = False # 确保状态
-            #     break 
-
-            hang_up_text = call_window.TextControl(Name=HANG_UP_BUTTON_LABEL)
-            refuse_msg = call_window.TextControl(Name=REFUSE_MSG)
-            if hang_up_text.Exists(0.1, 0.1) and not refuse_msg.Exists(0.1, 0.1):
-                logger.info(f"通话已接通！")
-                call_status = 1
-                break
-            elif hang_up_text.Exists(0.1, 0.1) and refuse_msg.Exists(0.1, 0.1):
-                logger.info(f"通话被拒接！")
-                call_status = 2
-                break
-            else:
-                continue
-
-        # --- 根据通话状态执行相应操作 ---
-        if call_status == 1:
-            '''
-            待完成：
-            1. 接通后如何捕捉挂断行为？
-            2. 挂断后如何中断语音播放？
-            3. bot 是否要针对挂断做出个性化回应？
-            '''
-            PlayVoice(audio_file_path=audio_file_path)
-            logger.info("语音播放完成，即将挂断...")
-            CancelCall(call_hwnd)
-        elif call_status ==2:
-            '''
-            待完成：
-            1. 可以让 bot 回复信息对拒接表示生气。
-            '''
-            pass
-        else:
-            '''
-            待完成：
-            1. 可以让 bot 回复信息对未接听表示生气。
-            '''
-            logger.info(f"在超时时间内，对方未接听通话。")
-            CancelCall(call_hwnd)
-
-    except Exception as e:
-        logger.error(f"处理通话时发生未知错误: {e}")
-        if call_hwnd is not None: # 对错误进行简单处理，确保有句柄再尝试取消
-            CancelCall(call_hwnd)
-
-# --- 主程序示例 (仅用于测试版) ---
 if __name__ == '__main__':
-    # 配置日志记录
+    import asyncio
+    from telegram import Bot
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(module)s.%(funcName)s: %(message)s',
-        handlers=[
-            logging.StreamHandler() # 输出到控制台
-        ]
+        handlers=[logging.StreamHandler()]
     )
-    logger.info("程序启动")
-    wx = WeChat()
-    who = "" # 输入通话对象名称
-    if wx and who:
-        try:
-            Call(wx, who, 'test.mp3')
-        except Exception as main_e:
-            logger.error(f"主程序执行过程中发生错误: {main_e}", exc_info=True)
-    else:
-        logger.error("未能初始化 WeChat 对象或未指定通话对象。")
 
-    logger.info("程序结束")
+    TOKEN = ""        # 填入 Bot Token
+    CHAT_ID = ""      # 填入目标 chat_id
+    AUDIO_FILE = "test.mp3"  # 填入测试音频路径
+
+    if TOKEN and CHAT_ID and os.path.exists(AUDIO_FILE):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        bot = Bot(token=TOKEN)
+        # 在后台线程中启动 loop
+        import threading
+        t = threading.Thread(target=loop.run_forever, daemon=True)
+        t.start()
+
+        logger.info("程序启动，测试语音提醒发送")
+        Call(bot=bot, tg_loop=loop, chat_id=CHAT_ID, audio_file_path=AUDIO_FILE)
+        logger.info("程序结束")
+    else:
+        logger.error("请先填写 TOKEN、CHAT_ID 并确保音频文件存在。")

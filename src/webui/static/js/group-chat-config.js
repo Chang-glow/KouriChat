@@ -1,6 +1,5 @@
 // 群聊配置相关功能
 window.groupChatConfigs = [];
-let groupChatConfigIndex = 0;
 
 // 初始化群聊配置
 window.initGroupChatConfig = function initGroupChatConfig() {
@@ -19,18 +18,16 @@ window.initGroupChatConfig = function initGroupChatConfig() {
 
 // 添加新的群聊配置
 function addGroupChatConfig() {
-    // 检查群聊配置数量限制
     if (window.groupChatConfigs.length >= 1) {
         alert('当前版本仅支持一个群聊配置，多个群聊会导致记忆混乱。\n\n支持私聊和群聊同步进行，但群聊配置限制为1个。');
         return;
     }
-    
     const newConfig = {
         id: 'group_' + Date.now(),
-        groupName: '',
+        groupName: '',   // 存储 Telegram 群聊 chat_id
         avatar: '',
         triggers: [],
-        enableAtTrigger: true  // 默认启用@触发
+        enableAtTrigger: true
     };
     window.groupChatConfigs.push(newConfig);
     updateGroupChatConfigData();
@@ -42,7 +39,7 @@ function addGroupChatConfig() {
 window.renderGroupChatConfigList = function renderGroupChatConfigList() {
     const container = document.getElementById('groupChatConfigList');
     if (!container) return;
-    
+
     if (window.groupChatConfigs.length === 0) {
         container.innerHTML = `
             <div class="text-center text-muted p-4 border rounded">
@@ -58,7 +55,7 @@ window.renderGroupChatConfigList = function renderGroupChatConfigList() {
         updateAddGroupChatButton();
         return;
     }
-    
+
     container.innerHTML = window.groupChatConfigs.map((config, index) => `
         <div class="config-item mb-3 p-3 border rounded" data-config-id="${config.id}">
             <div class="d-flex justify-content-between align-items-center mb-3">
@@ -66,54 +63,58 @@ window.renderGroupChatConfigList = function renderGroupChatConfigList() {
                     <i class="bi bi-chat-square-text me-2"></i>
                     群聊配置 ${index + 1}
                 </h6>
-                <button type="button" class="btn btn-outline-danger btn-sm" 
+                <button type="button" class="btn btn-outline-danger btn-sm"
                         onclick="removeGroupChatConfig('${config.id}')" title="删除此群聊配置">
                     <i class="bi bi-trash"></i>
                 </button>
             </div>
-            
+
             <div class="row">
-                <!-- 群聊名称 -->
+                <!-- 群聊 Chat ID -->
                 <div class="col-md-6 mb-3">
                     <label class="form-label">
-                        <i class="bi bi-people me-1"></i>群聊名称
+                        <i class="bi bi-people me-1"></i>群聊 Chat ID
                         <span class="text-danger">*</span>
                     </label>
-                    <select class="form-select" 
+                    <select class="form-select"
                             onchange="updateGroupChatConfigField('${config.id}', 'groupName', this.value)">
-                        <option value="">请选择群聊名称</option>
-                        ${getUserListOptions(config.groupName)}
+                        <option value="">请选择群聊 Chat ID</option>
+                        ${getChatIdOptions(config.groupName)}
                     </select>
+                    <div class="form-text">
+                        <i class="bi bi-info-circle me-1"></i>
+                        从已配置的 Chat ID 列表中选择目标群聊
+                    </div>
                 </div>
-                
+
                 <!-- 使用的人设 -->
                 <div class="col-md-6 mb-3">
                     <label class="form-label">
                         <i class="bi bi-person-badge me-1"></i>使用的人设
                         <span class="text-danger">*</span>
                     </label>
-                    <select class="form-select" 
+                    <select class="form-select"
                             onchange="updateGroupChatConfigField('${config.id}', 'avatar', this.value)">
                         <option value="">请选择人设</option>
                         ${getAvatarOptions(config.avatar)}
                     </select>
                 </div>
             </div>
-            
+
             <!-- @触发开关 -->
             <div class="mb-3">
                 <div class="form-check form-switch">
-                    <input class="form-check-input" type="checkbox" 
-                           id="atTrigger_${config.id}" 
+                    <input class="form-check-input" type="checkbox"
+                           id="atTrigger_${config.id}"
                            ${config.enableAtTrigger !== false ? 'checked' : ''}
                            onchange="updateGroupChatConfigField('${config.id}', 'enableAtTrigger', this.checked)">
                     <label class="form-check-label" for="atTrigger_${config.id}">
-                        <i class="bi bi-at me-1"></i>启用@机器人名字触发
+                        <i class="bi bi-at me-1"></i>启用 @机器人用户名 触发
                     </label>
                 </div>
                 <div class="form-text">
                     <i class="bi bi-info-circle me-1"></i>
-                    开启后，@机器人名字也会触发回复（建议保持开启）
+                    开启后，在群聊中 @机器人用户名 也会触发回复（建议保持开启）
                 </div>
             </div>
 
@@ -125,11 +126,11 @@ window.renderGroupChatConfigList = function renderGroupChatConfigList() {
                 </label>
                 <div class="form-text mb-2">
                     <i class="bi bi-info-circle me-1"></i>
-                    群聊中包含这些词语时会触发回复（如：角色名、小名、昵称等）
+                    群聊消息中包含这些词语时会触发回复（如：角色名、小名、昵称等）
                 </div>
-                
+
                 <div class="input-group mb-2">
-                    <input type="text" class="form-control" 
+                    <input type="text" class="form-control"
                            id="triggerInput_${config.id}"
                            placeholder="请输入触发词">
                     <button class="btn btn-primary" type="button"
@@ -137,20 +138,21 @@ window.renderGroupChatConfigList = function renderGroupChatConfigList() {
                         添加 <i class="bi bi-plus-lg"></i>
                     </button>
                 </div>
-                
+
                 <div class="list-group" id="triggerList_${config.id}">
                     ${config.triggers.map((trigger, triggerIndex) => `
-                        <div class="list-group-item d-flex justify-content-between align-items-center" data-trigger-index="${triggerIndex}">
+                        <div class="list-group-item d-flex justify-content-between align-items-center"
+                             data-trigger-index="${triggerIndex}">
                             ${trigger}
-                            <button type="button" class="btn btn-danger btn-sm" 
-                                    onclick="removeTriggerWordByIndex('${config.id}', ${triggerIndex})" 
+                            <button type="button" class="btn btn-danger btn-sm"
+                                    onclick="removeTriggerWordByIndex('${config.id}', ${triggerIndex})"
                                     title="删除触发词">
                                 <i class="bi bi-x-lg"></i>
                             </button>
                         </div>
                     `).join('')}
                 </div>
-                
+
                 ${config.triggers.length === 0 ? `
                     <div class="text-muted small mt-2">
                         <i class="bi bi-exclamation-triangle me-1"></i>
@@ -160,16 +162,14 @@ window.renderGroupChatConfigList = function renderGroupChatConfigList() {
             </div>
         </div>
     `).join('');
-    
-    // 更新添加按钮状态
+
     updateAddGroupChatButton();
 }
 
-// 获取人设选项（需要从现有的AVATAR_DIR选项中获取）
+// 获取人设选项
 function getAvatarOptions(selectedValue = '') {
     const avatarSelect = document.querySelector('select[name="AVATAR_DIR"]');
     if (!avatarSelect) return '<option value="">暂无可用人设</option>';
-    
     let options = '';
     for (let option of avatarSelect.options) {
         if (option.value) {
@@ -181,23 +181,21 @@ function getAvatarOptions(selectedValue = '') {
     return options || '<option value="">暂无可用人设</option>';
 }
 
-// 获取用户列表选项（从LISTEN_LIST中获取）
-function getUserListOptions(selectedValue = '') {
-    const userListElement = document.getElementById('selected_users_LISTEN_LIST');
-    if (!userListElement) return '<option value="">暂无可用用户</option>';
-    
-    const userElements = userListElement.querySelectorAll('.list-group-item');
+// 获取 Chat ID 选项（从 TELEGRAM_CHAT_IDS 配置中读取，替代原微信用户列表）
+function getChatIdOptions(selectedValue = '') {
+    const chatIdListEl = document.getElementById('selected_users_TELEGRAM_CHAT_IDS');
+    if (!chatIdListEl) return '<option value="">暂无可用 Chat ID</option>';
+
+    const items = chatIdListEl.querySelectorAll('.list-group-item');
     let options = '';
-    
-    userElements.forEach(element => {
-        const userName = element.textContent.trim().replace('×', '').trim();
-        if (userName) {
-            const selected = userName === selectedValue ? 'selected' : '';
-            options += `<option value="${userName}" ${selected}>${userName}</option>`;
+    items.forEach(el => {
+        const chatId = el.textContent.trim().replace('×', '').trim();
+        if (chatId) {
+            const selected = chatId === selectedValue ? 'selected' : '';
+            options += `<option value="${chatId}" ${selected}>${chatId}</option>`;
         }
     });
-    
-    return options || '<option value="">暂无可用用户</option>';
+    return options || '<option value="">暂无可用 Chat ID</option>';
 }
 
 // 更新群聊配置字段
@@ -209,9 +207,8 @@ function updateGroupChatConfigField(configId, field, value) {
     }
 }
 
-// 更新所有群聊配置中的群聊名称选择框
+// Chat ID 列表变化时刷新群聊配置下拉框
 function updateGroupChatConfigSelects() {
-    // 重新渲染群聊配置列表以更新选择框选项
     renderGroupChatConfigList();
 }
 
@@ -219,12 +216,7 @@ function updateGroupChatConfigSelects() {
 function addTriggerWord(configId) {
     const input = document.getElementById(`triggerInput_${configId}`);
     const triggerWord = input.value.trim();
-    
-    if (!triggerWord) {
-        alert('请输入触发词');
-        return;
-    }
-    
+    if (!triggerWord) { alert('请输入触发词'); return; }
     const config = window.groupChatConfigs.find(c => c.id === configId);
     if (config) {
         if (!config.triggers.includes(triggerWord)) {
@@ -235,16 +227,6 @@ function addTriggerWord(configId) {
         } else {
             alert('触发词已存在');
         }
-    }
-}
-
-// 删除触发词
-function removeTriggerWord(configId, triggerWord) {
-    const config = window.groupChatConfigs.find(c => c.id === configId);
-    if (config) {
-        config.triggers = config.triggers.filter(t => t !== triggerWord);
-        updateGroupChatConfigData();
-        renderGroupChatConfigList();
     }
 }
 
@@ -276,27 +258,24 @@ function updateGroupChatConfigData() {
     }
 }
 
-// 更新添加群聊配置按钮状态
+// 更新添加按钮状态
 function updateAddGroupChatButton() {
     const addButton = document.getElementById('addGroupChatBtn');
     if (!addButton) return;
-    
     if (window.groupChatConfigs.length >= 1) {
         addButton.disabled = true;
-        addButton.classList.remove('btn-primary');
-        addButton.classList.add('btn-secondary');
+        addButton.classList.replace('btn-primary', 'btn-secondary');
         addButton.innerHTML = '<i class="bi bi-check-lg me-1"></i>已达配置上限';
         addButton.title = '当前版本仅支持一个群聊配置';
     } else {
         addButton.disabled = false;
-        addButton.classList.remove('btn-secondary');
-        addButton.classList.add('btn-primary');
+        addButton.classList.replace('btn-secondary', 'btn-primary');
         addButton.innerHTML = '<i class="bi bi-plus-lg me-1"></i>添加群聊配置';
         addButton.title = '添加新的群聊配置';
     }
 }
 
 // 页面加载时初始化
-document.addEventListener('DOMContentLoaded', function() {
+document.addEventListener('DOMContentLoaded', function () {
     setTimeout(initGroupChatConfig, 500);
 });

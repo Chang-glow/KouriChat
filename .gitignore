@@ -1,3 +1,6 @@
+# dev
+/src/dev/
+
 /data/avatars/*
 !data/avatars/ATRI/
 !data/avatars/MONO/

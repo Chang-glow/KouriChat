@@ -21,6 +21,26 @@
                 }
             }
         },
+        "webhook_settings": {
+            "title": "Webhook 设置",
+            "settings": {
+                "enabled": {
+                    "value": true,
+                    "type": "boolean",
+                    "description": "是否启用 Webhook 模式（true 表示使用 Webhook，false 表示使用 Polling）"
+                },
+                "listen_port": {
+                    "value": 9000,
+                    "type": "number",
+                    "description": "本地监听端口（必须与 Docker 映射端口一致）"
+                },
+                "url": {
+                    "value": "",
+                    "type": "string",
+                    "description": "公网 Webhook 地址（例如 https://yourname.nyat.app:12345），路径部分会自动加上 Bot Token"
+                }
+            }
+        },
         "user_settings": {
             "title": "用户设置",
             "settings": {

@@ -131,6 +131,9 @@ class IntentRecognitionSettings:
 class Config:
     def __init__(self):
         self.bot: BotSettings
+        self.webhook_enabled: bool = True
+        self.webhook_listen_port: int = 9000
+        self.webhook_url: str = ""
         self.user: UserSettings
         self.llm: LLMSettings
         self.media: MediaSettings
@@ -318,6 +321,12 @@ class Config:
                     name=bot_data.get('name', {}).get('value', ''),
                     proxy_url=bot_data.get('proxy_url', {}).get('value', '')
                 )
+
+                # ---------- Webhook 设置 ----------
+                webhook_data = categories.get('webhook_settings', {}).get('settings', {})
+                self.webhook_enabled = webhook_data.get('enabled', {}).get('value', True)
+                self.webhook_listen_port = webhook_data.get('listen_port', {}).get('value', 9000)
+                self.webhook_url = webhook_data.get('url', {}).get('value', '')
 
                 # ---------- 用户设置 ----------
                 user_data = categories['user_settings']['settings']

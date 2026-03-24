@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  kourichat:
+    cap_add:
+      - SYS_PTRACE
+    build: .
+    ports:
+      - "8502:8502"
+      - "9000:9000"
+    volumes:
+      - ./data:/app/data     # 持久化配置、记忆、数据库
+      - ./logs:/app/logs     # 持久化日志
+      - ./src/base:/app/src/base   # 如果需要手动修改人设文件
+    restart: unless-stopped
+    environment:
+      - SDL_AUDIODRIVER=dummy   # 确保音频驱动设置 
+      - TZ=Asia/Shanghai

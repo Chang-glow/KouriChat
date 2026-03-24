@@ -84,9 +84,9 @@ private_message_queue = queue.Queue()
 group_message_queue = queue.Queue()
 
 
-# ── 修复4：有界消息去重缓存，防止 processed_messages 无限增长 ────────────────────
+# ── 有界消息去重缓存，防止 processed_messages 无限增长 ────────────────────
 
-_PROCESSED_MSG_MAX = 2000
+_PROCESSED_MSG_MAX = 10000
 
 
 class BoundedMessageCache:
@@ -137,15 +137,15 @@ class PrivateChatBot:
     """处理 Telegram 私聊消息"""
 
     def __init__(self, msg_handler, image_recognition_service, auto_sender,
-                 emoji_handler, bot: Bot, tg_loop, memory_service_ref):  # 修复1：新增 memory_service_ref
+                 emoji_handler, bot: Bot, tg_loop, memory_service_ref):  
         self.message_handler = msg_handler
         self.image_recognition_service = image_recognition_service
         self.auto_sender = auto_sender
         self.emoji_handler = emoji_handler
         self.bot = bot
         self.tg_loop = tg_loop
-        self.memory_service = memory_service_ref          # 修复1：保存引用
-        self._initialized_users: set = set()              # 修复1：已初始化用户缓存
+        self.memory_service = memory_service_ref          
+        self._initialized_users: set = set()             
         self.robot_name = getattr(getattr(config, 'bot', None), 'name', 'Bot')
 
         default_avatar_path = config.behavior.context.avatar_dir
@@ -153,7 +153,7 @@ class PrivateChatBot:
         logger.info(f"私聊机器人初始化完成 - 名称: {self.robot_name}, 人设: {self.current_avatar}")
 
     def _ensure_user_memory(self, username: str):
-        """修复1 & 5：首次遇到该用户时动态初始化记忆文件"""
+        """首次遇到该用户时动态初始化记忆文件"""
         if username in self._initialized_users:
             return
         try:
@@ -171,7 +171,7 @@ class PrivateChatBot:
             sender_name = tg_msg.sender_name
             content = tg_msg.content
 
-            self._ensure_user_memory(username)   # 修复1：首次调用时初始化
+            self._ensure_user_memory(username)   
             self.auto_sender.start_countdown()
             logger.info(f"[私聊] 来自: {sender_name}({username})")
             logger.debug(f"[私聊] 内容: {content}")
@@ -432,34 +432,11 @@ def initialize_services(bot: Bot, tg_loop):
     )
 
     # 获取 Bot 自身 username
-    async def _get_bot_name():
-        me = await bot.get_me()
-        return me.username or me.first_name
-
-    # 优先从配置中读取用户填写的 BOT_NAME
     ROBOT_TG_NAME = getattr(getattr(config, 'bot', None), 'name', '')
-
-    # 如果配置中没有，则尝试从 Telegram API 获取（带重试）
     if not ROBOT_TG_NAME:
-        async def _get_bot_name_with_retry():
-            for attempt in range(3):  # 最多重试3次
-                try:
-                    me = await bot.get_me()
-                    return me.username or me.first_name
-                except Exception as e:
-                    if attempt == 2:
-                        raise
-                    logger.warning(f"获取 Bot 名称失败 (尝试 {attempt + 1}/3): {e}")
-                    await asyncio.sleep(1)
-
-        try:
-            ROBOT_TG_NAME = asyncio.run_coroutine_threadsafe(
-                _get_bot_name_with_retry(), tg_loop
-            ).result(timeout=15)
-            logger.info(f"从 API 获取到 Bot 名称: {ROBOT_TG_NAME}")
-        except Exception as e:
-            logger.warning(f"获取 Bot 名称最终失败: {str(e)}")
-            ROBOT_TG_NAME = ""
+        # 配置中没有，使用默认名称
+        ROBOT_TG_NAME = "KouriChatBot"
+        logger.warning(f"配置中未指定 bot.name，使用默认名称: {ROBOT_TG_NAME}")
 
     # 创建消息处理器
     message_handler = BotMessageHandler(
@@ -661,11 +638,20 @@ def main():
 
         # 获取代理配置
         proxy_url = getattr(getattr(config, 'bot', None), 'proxy_url', None)
+
+        # 自定义请求配置，增加重试次数
+        request_kwargs = {
+            'connect_timeout': 10.0,
+            'read_timeout': 10.0,
+            'write_timeout': 10.0,
+            'pool_timeout': 10.0,
+            'retry_count': 5,          # 默认 3，增加到 5
+        }   
         if proxy_url:
-            application = ApplicationBuilder().token(tg_token).proxy_url(proxy_url).build()
-            logger.info(f"使用代理: {proxy_url}")
-        else:
-            application = ApplicationBuilder().token(tg_token).build()
+            request_kwargs['proxy_url'] = proxy_url
+
+        request = HTTPXRequest(**request_kwargs)
+        application = ApplicationBuilder().token(tg_token).request(request).build()
 
         # 注册 Handler
         application.add_handler(CommandHandler("start", on_start))
@@ -741,8 +727,22 @@ def main():
 
         application.post_init = post_init
 
-        # 启动 Bot（阻塞直到收到停止信号）
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        if config.webhook_enabled:
+            # Webhook 模式
+            webhook_url = config.webhook_url.rstrip('/')
+            webhook_url_path = config.bot.token
+            full_webhook_url = f"{webhook_url}/{webhook_url_path}"
+
+            application.run_webhook(
+                listen="0.0.0.0",
+                port=config.webhook_listen_port,
+                url_path=webhook_url_path,
+                webhook_url=full_webhook_url,
+                allowed_updates=Update.ALL_TYPES
+            )
+        else:
+            # Polling 模式（兜底）
+            application.run_polling(allowed_updates=Update.ALL_TYPES)
 
     except Exception as e:
         print_status(f"主程序异常: {str(e)}", "error", "ERROR")

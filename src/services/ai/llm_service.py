@@ -408,6 +408,7 @@ class LLMService:
 
                     # 获取原始内容
                     raw_content = response.choices[0].message.content
+                    logger.info(f"AI原始输出 (长度 {len(raw_content)}): {repr(raw_content)}") 
 
                 # 清理响应内容
                 clean_content = self._sanitize_response(raw_content)

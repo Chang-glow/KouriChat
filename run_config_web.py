@@ -33,6 +33,8 @@ import socket
 import webbrowser
 import hashlib
 import secrets
+import select
+import queue
 from datetime import timedelta
 from src.utils.console import print_status
 from src.avatar_manager import avatar_manager
@@ -51,6 +53,7 @@ if sys.platform.startswith('win'):
         _WIN32_AVAILABLE = False
 else:
     _WIN32_AVAILABLE = False
+    import fcntl
 
 # 全局变量
 bot_process = None
@@ -842,24 +845,58 @@ def start_bot_process():
 
 
 def start_log_reading_thread():
-    def read_output():
-        try:
-            while bot_process and bot_process.poll() is None:
-                if bot_process.stdout:
-                    line = bot_process.stdout.readline()
-                    if line:
-                        try:
-                            line = line.strip()
-                            if isinstance(line, bytes):
-                                line = line.decode('utf-8', errors='replace')
+    def read_output():    
+        # 获取文件描述符，设置为非阻塞
+        fd = bot_process.stdout.fileno()
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    
+        buffer = b''
+        while bot_process and bot_process.poll() is None:
+            try:
+                rlist, _, _ = select.select([fd], [], [], 1.0)
+                if fd in rlist:
+                    data = os.read(fd, 4096)
+                    if not data:
+                        # 管道关闭，可能子进程退出，继续循环以便处理 buffer
+                        continue
+                    buffer += data
+                    # 按行分割
+                    while b'\n' in buffer:
+                        line, buffer = buffer.split(b'\n', 1)
+                        line = line.decode('utf-8', errors='replace').strip()
+                        if line:
                             timestamp = datetime.datetime.now().strftime('%H:%M:%S')
-                            bot_logs.put(f"[{timestamp}] {line}")
-                        except Exception as e:
-                            logger.error(f"日志处理错误: {str(e)}")
-        except Exception as e:
-            logger.error(f"读取日志失败: {str(e)}")
-            bot_logs.put(f"[ERROR] 读取日志失败: {str(e)}")
-    threading.Thread(target=read_output, daemon=True).start()
+                            # 队列满时丢弃最旧日志
+                            try:
+                                bot_logs.put(f"[{timestamp}] {line}", block=False)
+                            except queue.Full:
+                                try:
+                                    bot_logs.get_nowait()
+                                    bot_logs.put_nowait(f"[{timestamp}] {line}")
+                                except queue.Empty:
+                                    pass
+            except (OSError, IOError) as e:
+                # 管道可能被关闭，短暂休眠后继续
+                logger.warning(f"读取日志时遇到 IO 错误: {e}")
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"读取日志时发生未预期错误: {e}", exc_info=True)
+                time.sleep(1)
+
+        # 子进程已退出，处理 buffer 中可能残留的最后一行
+        if buffer:
+            line = buffer.decode('utf-8', errors='replace').strip()
+            if line:
+                timestamp = datetime.datetime.now().strftime('%H:%M:%S')
+                try:
+                    bot_logs.put(f"[{timestamp}] {line}", block=False)
+                except queue.Full:
+                    try:
+                        bot_logs.get_nowait()
+                        bot_logs.put_nowait(f"[{timestamp}] {line}")
+                    except queue.Empty:
+                        pass
 
 
 def get_bot_uptime():
